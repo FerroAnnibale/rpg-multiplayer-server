@@ -1,53 +1,91 @@
 # RPG Maker MV multiplayer server
 
-This server provides one global chat and broadcasts player positions. The game
-shows a remote character only when that player is on the same map.
+The server provides global chat, same-map player visibility, saved player
+accounts, persistent Character Creator appearances, moderation, and
+administrator commands. Account records and moderation state are stored in
+PostgreSQL; the game itself still does not synchronize maps, battles, quests,
+inventory, or save files.
 
-## Run locally
+## Database and server configuration
 
-1. Install Node.js.
-2. From this folder, run `npm install`.
-3. Choose a private code with at least 16 characters. Players will enter it in
-   the in-game login prompt; configure it only on the server. Do not put the
-   server code in a command-line argument or commit it to source control.
-4. On Windows PowerShell, enter the code without putting it in the command
-   history, then start the server:
+Use a durable PostgreSQL database such as Neon. Create a database and copy its
+connection string (including `sslmode=require`). On Render, add these environment
+variables under the multiplayer web service's **Environment** settings:
 
-   ```powershell
-   $securePassword = Read-Host "Lobby code" -AsSecureString
-   $env:LOBBY_PASSWORD = [Net.NetworkCredential]::new("", $securePassword).Password
-   npm start
-   ```
+- `DATABASE_URL`: the PostgreSQL connection string.
+- `LOBBY_PASSWORD`: the existing shared lobby code (at least 16 characters).
+- `ADMIN_USERNAME`: `Ferro`.
+- `ADMIN_BOOTSTRAP_SECRET`: a private random secret of at least 32 characters.
+- `MAX_PLAYERS`: optional; defaults to `20`.
 
-   Keep that terminal open while the server is in use. After stopping it, clear
-   the environment variable with `$env:LOBBY_PASSWORD = $null`.
-5. In RPG Maker MV's Plugin Manager, enable `Multiplayer` and set `Server URL`
-   to `ws://localhost:3000`. For other computers on your LAN, replace
-   `localhost` with the server computer's local IP address. Set a default
-   `Player Name` if desired; players can change it at the login prompt.
-6. At the title screen, enter the player name and shared lobby code before
-   starting or continuing the game. The map remains paused until authentication
-   succeeds. The code stays in memory for reconnects and is not saved in game
-   files. Incoming messages appear briefly with a fade; press Enter to open the
-   full chat.
+Keep the database URL, lobby code, and bootstrap secret out of the game files
+and source control. The bootstrap secret is required only when creating the
+first account named `Ferro`; the admin role is assigned by the server, never by
+the client. Keep it private and rotate it after registration.
 
-The health check is available at `http://localhost:3000/`.
+For local development, install Node.js and run `npm install` from this folder.
+In PowerShell, configure the same values and start the service:
 
-## Play with friends
+```powershell
+$env:DATABASE_URL = Read-Host "Neon PostgreSQL connection string"
+$secureLobby = Read-Host "Lobby code" -AsSecureString
+$env:LOBBY_PASSWORD = [Net.NetworkCredential]::new("", $secureLobby).Password
+$env:ADMIN_USERNAME = "Ferro"
+$secureBootstrap = Read-Host "Admin bootstrap secret" -AsSecureString
+$env:ADMIN_BOOTSTRAP_SECRET = [Net.NetworkCredential]::new("", $secureBootstrap).Password
+npm start
+```
 
-For internet play, deploy the server behind a TLS reverse proxy with a real
-domain and certificate. Point all clients to `wss://your-domain.example`, and
-keep `LOBBY_PASSWORD` configured in the server's environment. Do not expose the
-server over plain `ws://` on the internet: the shared code would be sent
-unencrypted. Browsers also block insecure WebSockets from HTTPS-hosted games.
+The server creates its account table automatically on startup. PostgreSQL
+stores unique usernames (case-insensitive), scrypt password hashes, saved
+Character Creator appearance data, bans, and mutes. The health check is
+available at `http://localhost:3000/`.
 
-The shared code is entered at runtime rather than shipped inside the game
-client. It is still a shared secret, not account-grade authentication. Use a
-long random code, share it privately, and rotate it if it leaks. A domain, TLS
-certificate, and hosting provider are not included in this project and must be
-configured separately.
+## Register and log in
 
-This first version synchronizes chat and locations only. It does not synchronize
-events, battles, inventory, or game progress. The server accepts up to 20
-connections by default; set `MAX_PLAYERS` or `PORT` in the server environment to
-change its defaults.
+At the title screen, each player chooses **Registrati** the first time and
+enters a unique name, a password of at least 12 characters, and the shared
+lobby code. Names use 3-24 ASCII letters, numbers, or underscores and are
+case-insensitive. On later visits, players choose **Accedi** with the same
+account credentials and lobby code. Account credentials are not stored in the
+game's save file.
+
+The first registration using the configured admin name also requires the
+bootstrap secret. After creating the `Ferro` account, rotate that secret in
+Render and keep the replacement configured for server startup. Passwords are
+stored as salted scrypt hashes.
+
+Character Creator appearance metadata is saved to the account record and sent
+to other players when they join, including after server or browser restarts.
+If the local save has no appearance, the game restores the account's saved
+appearance when the account logs in.
+
+## Chat and admin commands
+
+Press Enter on a map to open chat. Normal messages are visible to everyone.
+Only the server-authorized admin account can use commands beginning with `!`:
+
+- `!kick nome` disconnects an online player.
+- `!ban nome [minuti]` blocks an account from logging in; without a duration
+  the ban is permanent. Timed bans accept 1-525600 minutes.
+- `!unban nome` removes a ban.
+- `!mute nome [minuti]` blocks chat; without a duration the mute is permanent.
+- `!unmute nome` removes a mute.
+- `!item nome id quantita` grants a database item to that online player's
+  local party.
+- `!weapon nome id quantita` and `!armor nome id quantita` grant equipment.
+- `!actor nome id` and `!unactor nome id` add or remove a party member.
+- `!help` prints the command list.
+
+Item and actor commands are delivered only to the named player while online.
+They affect that player's local game save and require matching game database
+IDs; offline commands are not queued. The game does not synchronize inventory,
+party membership, battles, or progress between players.
+
+## Hosting
+
+Set the `Server URL` plugin parameter to `ws://localhost:3000` for local tests
+or `wss://rpg-multiplayer-server-get3.onrender.com` for the hosted server.
+Use `wss://` for internet play; browsers block insecure WebSockets from
+HTTPS-hosted games. Free Render services can spin down after inactivity, so
+the first connection may take around a minute to wake up.
