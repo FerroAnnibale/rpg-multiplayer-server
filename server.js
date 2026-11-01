@@ -13,6 +13,7 @@ var adminUsername = String(process.env.ADMIN_USERNAME || '').trim();
 var adminUsernameKey = adminUsername.toLowerCase();
 var adminBootstrapSecret = process.env.ADMIN_BOOTSTRAP_SECRET || '';
 var players = new Map();
+var trades = new Map();
 var authenticationAttempts = new Map();
 var pool;
 
@@ -238,6 +239,112 @@ function findOnlineUser(usernameKey) {
         }
     });
     return online;
+}
+
+function findOnlinePlayer(playerId) {
+    var online = null;
+    players.forEach(function(player, socket) {
+        if (!online && player.id === playerId && socket.readyState === WebSocket.OPEN) {
+            online = { player: player, socket: socket };
+        }
+    });
+    return online;
+}
+
+function playersCanInteract(first, second) {
+    return first && second && first.id !== second.id && first.visible && second.visible &&
+        first.mapId > 0 && first.mapId === second.mapId;
+}
+
+function tradeParticipant(trade, playerId) {
+    return trade && (trade.firstId === playerId || trade.secondId === playerId);
+}
+
+function otherTradeParticipant(trade, playerId) {
+    return trade.firstId === playerId ? trade.secondId : trade.firstId;
+}
+
+function tradeUpdate(socket, trade, status, text) {
+    var player = players.get(socket);
+    if (!player || !tradeParticipant(trade, player.id)) {
+        return;
+    }
+    var otherId = otherTradeParticipant(trade, player.id);
+    var other = findOnlinePlayer(otherId);
+    sendToSocket(socket, {
+        type: 'trade_update',
+        tradeId: trade.id,
+        status: status,
+        text: text,
+        peerId: other ? other.player.id : '',
+        peerName: other ? other.player.name : '',
+        ownOffer: trade.offers[player.id] || null,
+        otherOffer: trade.offers[otherId] || null,
+        ownConfirmed: !!trade.confirmed[player.id],
+        otherConfirmed: !!trade.confirmed[otherId]
+    });
+}
+
+function updateTradeParticipants(trade, status, text) {
+    var first = findOnlinePlayer(trade.firstId);
+    var second = findOnlinePlayer(trade.secondId);
+    if (first) {
+        tradeUpdate(first.socket, trade, status, text);
+    }
+    if (second) {
+        tradeUpdate(second.socket, trade, status, text);
+    }
+}
+
+function finishTrade(trade, status, text) {
+    if (!trade) {
+        return;
+    }
+    trades.delete(trade.id);
+    var first = findOnlinePlayer(trade.firstId);
+    var second = findOnlinePlayer(trade.secondId);
+    [first, second].forEach(function(online) {
+        if (online) {
+            online.player.currentTradeId = '';
+            sendToSocket(online.socket, {
+                type: 'trade_update',
+                tradeId: trade.id,
+                status: status,
+                text: text,
+                peerId: '',
+                peerName: '',
+                ownOffer: null,
+                otherOffer: null,
+                ownConfirmed: false,
+                otherConfirmed: false
+            });
+        }
+    });
+}
+
+function cancelTradeForPlayer(player) {
+    var trade = player.currentTradeId && trades.get(player.currentTradeId);
+    if (trade) {
+        finishTrade(trade, 'cancelled', 'Scambio annullato perché un giocatore si è disconnesso.');
+    }
+}
+
+function validTradeOffer(value) {
+    if (value === null) {
+        return true;
+    }
+    return !!value && typeof value === 'object' && !Array.isArray(value) &&
+        ['item', 'weapon', 'armor'].indexOf(value.itemType) !== -1 &&
+        Number.isInteger(value.id) && value.id >= 1 && value.id <= 9999 &&
+        Number.isInteger(value.amount) && value.amount >= 1 && value.amount <= 99;
+}
+
+function sendInteractionError(socket, text, requestId) {
+    var payload = { type: 'interaction_error', text: text };
+    if (typeof requestId === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(requestId)) {
+        payload.requestId = requestId;
+    }
+    sendToSocket(socket, payload);
 }
 
 function sendAdminResult(socket, text) {
@@ -557,7 +664,9 @@ async function authenticateSocket(socket, message, context) {
         y: 0,
         direction: 2,
         visible: false,
-        lastChatAt: 0
+        lastChatAt: 0,
+        lastPrivateChatAt: 0,
+        currentTradeId: ''
     };
     players.set(socket, context.player);
     authenticationAttempts.delete(attemptKey);
@@ -603,6 +712,10 @@ async function handleMessage(socket, context, message) {
 
     var player = context.player;
     if (message.type === 'position') {
+        if (player.currentTradeId &&
+                (Number(message.mapId) !== player.mapId || message.visible === false)) {
+            cancelTradeForPlayer(player);
+        }
         if (updatePosition(player, message)) {
             broadcastPlayers();
         }
@@ -631,6 +744,9 @@ async function handleMessage(socket, context, message) {
         }
     } else if (message.type === 'visibility') {
         player.visible = message.visible === true;
+        if (!player.visible) {
+            cancelTradeForPlayer(player);
+        }
         broadcastPlayers();
     } else if (message.type === 'chat') {
         var text = boundedString(message.text, 300, '');
@@ -656,6 +772,164 @@ async function handleMessage(socket, context, message) {
                 name: player.name,
                 text: text
             });
+        }
+    } else if (message.type === 'private_chat') {
+        var target = findOnlinePlayer(message.targetId);
+        var privateText = boundedString(message.text, 300, '');
+        var privateRequestId = typeof message.requestId === 'string' &&
+            /^[A-Za-z0-9_-]{1,80}$/.test(message.requestId) ? message.requestId : '';
+        var privateNow = Date.now();
+        var privateMuteExpiry = player.mutedUntil ? new Date(player.mutedUntil).getTime() : null;
+        if (player.isMuted && privateMuteExpiry && privateMuteExpiry <= privateNow) {
+            await pool.query(
+                'UPDATE multiplayer_users SET is_muted = FALSE, mute_until = NULL WHERE id = $1',
+                [player.userId]
+            );
+            player.isMuted = false;
+            player.mutedUntil = null;
+        }
+        if (player.isMuted) {
+            sendInteractionError(socket, 'Non puoi inviare messaggi: sei silenziato.', privateRequestId);
+        } else if (!target || !playersCanInteract(player, target.player)) {
+            sendInteractionError(socket, 'Il giocatore non è più disponibile sulla tua mappa.',
+                privateRequestId);
+        } else if (privateText && privateNow - player.lastPrivateChatAt >= 750) {
+            player.lastPrivateChatAt = privateNow;
+            var privatePayload = {
+                type: 'private_message',
+                fromId: player.id,
+                peerId: target.player.id,
+                fromName: player.name,
+                text: privateText,
+                requestId: privateRequestId
+            };
+            sendToSocket(target.socket, privatePayload);
+            sendToSocket(socket, {
+                type: 'private_message',
+                fromId: player.id,
+                peerId: target.player.id,
+                fromName: player.name,
+                text: privateText,
+                own: true,
+                requestId: privateRequestId
+            });
+        } else if (privateText) {
+            sendInteractionError(socket, 'Attendi prima di inviare un altro messaggio.',
+                privateRequestId);
+        }
+    } else if (message.type === 'trade_request') {
+        var tradeTarget = findOnlinePlayer(message.targetId);
+        if (!tradeTarget || !playersCanInteract(player, tradeTarget.player)) {
+            sendInteractionError(socket, 'Il giocatore non è più disponibile sulla tua mappa.');
+        } else if (player.currentTradeId || tradeTarget.player.currentTradeId) {
+            sendInteractionError(socket, 'Uno dei due giocatori è già impegnato in uno scambio.');
+        } else {
+            var trade = {
+                id: crypto.randomBytes(16).toString('hex'),
+                firstId: player.id,
+                secondId: tradeTarget.player.id,
+                status: 'invited',
+                offers: {},
+                confirmed: {},
+                ready: {}
+            };
+            trades.set(trade.id, trade);
+            player.currentTradeId = trade.id;
+            tradeTarget.player.currentTradeId = trade.id;
+            updateTradeParticipants(trade, 'invited', 'Richiesta di scambio inviata a ' +
+                tradeTarget.player.name + '.');
+            sendToSocket(tradeTarget.socket, {
+                type: 'trade_invite',
+                tradeId: trade.id,
+                fromId: player.id,
+                fromName: player.name
+            });
+        }
+    } else if (message.type === 'trade_reply') {
+        var invitedTrade = trades.get(message.tradeId);
+        if (!invitedTrade || invitedTrade.status !== 'invited' ||
+                invitedTrade.secondId !== player.id || typeof message.accepted !== 'boolean') {
+            sendInteractionError(socket, 'La richiesta di scambio non è più valida.');
+        } else if (!message.accepted) {
+            finishTrade(invitedTrade, 'declined', player.name + ' ha rifiutato lo scambio.');
+        } else {
+            invitedTrade.status = 'negotiating';
+            updateTradeParticipants(invitedTrade, 'negotiating',
+                'Scambio avviato. Offrite un oggetto e confermate entrambi.');
+        }
+    } else if (message.type === 'trade_offer') {
+        var offerTrade = trades.get(message.tradeId);
+        if (!offerTrade || offerTrade.status !== 'negotiating' ||
+                !tradeParticipant(offerTrade, player.id) || offerTrade.confirmed[player.id] ||
+                !validTradeOffer(message.offer)) {
+            sendInteractionError(socket, 'Offerta non valida o scambio non modificabile.');
+        } else {
+            offerTrade.offers[player.id] = message.offer;
+            offerTrade.confirmed = {};
+            updateTradeParticipants(offerTrade, 'negotiating', 'Offerta aggiornata.');
+        }
+    } else if (message.type === 'trade_confirm') {
+        var confirmedTrade = trades.get(message.tradeId);
+        if (!confirmedTrade || confirmedTrade.status !== 'negotiating' ||
+                !tradeParticipant(confirmedTrade, player.id) ||
+                !confirmedTrade.offers[player.id] || confirmedTrade.confirmed[player.id]) {
+            sendInteractionError(socket, 'Aggiungi un oggetto prima di confermare lo scambio.');
+        } else {
+            confirmedTrade.confirmed[player.id] = true;
+            if (confirmedTrade.confirmed[confirmedTrade.firstId] &&
+                    confirmedTrade.confirmed[confirmedTrade.secondId]) {
+                confirmedTrade.status = 'checking';
+                confirmedTrade.ready = {};
+                [confirmedTrade.firstId, confirmedTrade.secondId].forEach(function(playerId) {
+                    var online = findOnlinePlayer(playerId);
+                    var otherId = otherTradeParticipant(confirmedTrade, playerId);
+                    if (online) {
+                        sendToSocket(online.socket, {
+                            type: 'trade_check',
+                            tradeId: confirmedTrade.id,
+                            ownOffer: confirmedTrade.offers[playerId],
+                            otherOffer: confirmedTrade.offers[otherId]
+                        });
+                    }
+                });
+                updateTradeParticipants(confirmedTrade, 'checking',
+                    'Verifica degli oggetti prima dello scambio...');
+            } else {
+                updateTradeParticipants(confirmedTrade, 'negotiating',
+                    player.name + ' ha confermato. In attesa dell’altro giocatore.');
+            }
+        }
+    } else if (message.type === 'trade_ready') {
+        var readyTrade = trades.get(message.tradeId);
+        if (!readyTrade || readyTrade.status !== 'checking' ||
+                !tradeParticipant(readyTrade, player.id) || typeof message.ready !== 'boolean') {
+            sendInteractionError(socket, 'Verifica dello scambio non valida.');
+        } else if (!message.ready) {
+            finishTrade(readyTrade, 'cancelled',
+                'Scambio annullato: un oggetto non è più disponibile o non è compatibile.');
+        } else {
+            readyTrade.ready[player.id] = true;
+            if (readyTrade.ready[readyTrade.firstId] && readyTrade.ready[readyTrade.secondId]) {
+                readyTrade.status = 'committing';
+                [readyTrade.firstId, readyTrade.secondId].forEach(function(playerId) {
+                    var online = findOnlinePlayer(playerId);
+                    var otherId = otherTradeParticipant(readyTrade, playerId);
+                    if (online) {
+                        sendToSocket(online.socket, {
+                            type: 'trade_commit',
+                            tradeId: readyTrade.id,
+                            ownOffer: readyTrade.offers[playerId],
+                            otherOffer: readyTrade.offers[otherId]
+                        });
+                    }
+                });
+                finishTrade(readyTrade, 'completed', 'Scambio completato.');
+            }
+        }
+    } else if (message.type === 'trade_cancel') {
+        var cancelledTrade = trades.get(message.tradeId);
+        if (cancelledTrade && tradeParticipant(cancelledTrade, player.id)) {
+            finishTrade(cancelledTrade, 'cancelled', player.name + ' ha annullato lo scambio.');
         }
     } else if (message.type === 'admin_command' && typeof message.text === 'string') {
         await handleAdminCommand(socket, player, boundedString(message.text, 300, ''));
@@ -702,6 +976,7 @@ webSocketServer.on('connection', function(socket) {
     socket.on('close', function() {
         clearTimeout(context.authenticationTimer);
         if (context.authenticated) {
+            cancelTradeForPlayer(context.player);
             players.delete(socket);
             broadcastPlayers();
         }

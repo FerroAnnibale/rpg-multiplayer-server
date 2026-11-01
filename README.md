@@ -1,10 +1,10 @@
 # RPG Maker MV multiplayer server
 
-The server provides global chat, same-map player visibility, saved player
-accounts, persistent Character Creator appearances, moderation, and
-administrator commands. Account records and moderation state are stored in
-PostgreSQL; the game itself still does not synchronize maps, battles, quests,
-inventory, or save files.
+The server provides global and private chat, same-map player visibility and
+interactions, item trades, saved player accounts, persistent Character Creator
+appearances, moderation, and administrator commands. Account records and
+moderation state are stored in PostgreSQL; the game itself still does not
+synchronize maps, battles, quests, or save files.
 
 ## Database and server configuration
 
@@ -60,10 +60,29 @@ to other players when they join, including after server or browser restarts.
 If the local save has no appearance, the game restores the account's saved
 appearance when the account logs in.
 
-## Chat and admin commands
+## Player interactions
 
-Press Enter on a map to open chat. Normal messages are visible to everyone.
-Only the server-authorized admin account can use commands beginning with `!`:
+Click another visible player on the same map to open the interaction panel;
+the click still sets the map destination. Players can start a private chat
+(press Enter or click **Invia**) or request an item trade. Private messages are
+delivered only to the two participants and are not saved. Trades support one
+offer per player at a time: an unequipped inventory item, weapon, or armor and
+a quantity. Both players must confirm; the game checks each local inventory
+and available capacity before applying the exchange. Leaving the map,
+disconnecting, or closing the trade cancels it. These exchanges update each
+player's local save; the server does not synchronize inventories or game
+progress.
+
+The client and server must both include the interaction protocol. If a request
+is not acknowledged, update the hosted server from this `server.js`; until then
+the client reports that the feature may be unavailable rather than waiting
+indefinitely.
+
+## Global chat and admin commands
+
+Press Enter on a map to open global chat. Normal messages are visible to
+everyone. Only the server-authorized admin account can use commands beginning
+with `!`:
 
 - `!kick nome` disconnects an online player.
 - `!ban nome [minuti]` blocks an account from logging in; without a duration
