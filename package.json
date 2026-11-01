@@ -1,0 +1,13 @@
+{
+  "name": "rpg-maker-mv-multiplayer-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Small WebSocket server for global chat and RPG Maker MV player presence.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
