@@ -63,6 +63,50 @@ function validCoordinate(value) {
     return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 10000;
 }
 
+function sanitizeCharacterInfo(value) {
+    if (value === null) {
+        return null;
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return undefined;
+    }
+
+    var sections = Object.keys(value);
+    if (sections.length > 32) {
+        return undefined;
+    }
+
+    var result = {};
+    for (var i = 0; i < sections.length; i++) {
+        var section = sections[i];
+        var piece = value[section];
+        if (!section || section.length > 64 || /[\u0000-\u001f\u007f]/.test(section) ||
+                section === '__proto__' || section === 'constructor' || section === 'prototype' ||
+                !piece || typeof piece !== 'object' || Array.isArray(piece) ||
+                typeof piece.path !== 'string' ||
+                piece.path.indexOf('..') !== -1 ||
+                !/^img\/SumRndmDde\/character-creator-ex\/[A-Za-z0-9 _.-]{1,64}\/walk\/$/.test(piece.path) ||
+                typeof piece.file !== 'string' || piece.file.length > 128 ||
+                !piece.file || /[\\/\u0000-\u001f\u007f]/.test(piece.file) ||
+                !Array.isArray(piece.color) || piece.color.length > 5 ||
+                !piece.color.every(function(color) {
+                    return typeof color === 'number' && Number.isFinite(color) &&
+                        Math.abs(color) <= 1000;
+                })) {
+            return undefined;
+        }
+        result[section] = {
+            path: piece.path,
+            file: piece.file,
+            color: piece.color
+        };
+    }
+    if (JSON.stringify(result).length > 3500) {
+        return undefined;
+    }
+    return result;
+}
+
 function passwordsMatch(candidate) {
     if (typeof candidate !== 'string') {
         return false;
@@ -135,6 +179,7 @@ webSocketServer.on('connection', function(socket) {
                 name: 'Giocatore',
                 characterName: '',
                 characterIndex: 0,
+                characterInfo: null,
                 mapId: 0,
                 x: 0,
                 y: 0,
@@ -145,12 +190,32 @@ webSocketServer.on('connection', function(socket) {
             players.set(socket, player);
             socket.send(JSON.stringify({ type: 'welcome', id: player.id }));
             broadcastPlayers();
+            players.forEach(function(existingPlayer) {
+                if (existingPlayer !== player) {
+                    socket.send(JSON.stringify({
+                        type: 'appearance',
+                        id: existingPlayer.id,
+                        characterInfo: existingPlayer.characterInfo
+                    }));
+                }
+            });
             return;
         }
 
         if (message.type === 'position') {
             if (updatePosition(player, message)) {
                 broadcastPlayers();
+            }
+        } else if (message.type === 'appearance') {
+            var characterInfo = sanitizeCharacterInfo(message.characterInfo);
+            if (characterInfo !== undefined &&
+                    JSON.stringify(characterInfo) !== JSON.stringify(player.characterInfo)) {
+                player.characterInfo = characterInfo;
+                broadcast({
+                    type: 'appearance',
+                    id: player.id,
+                    characterInfo: player.characterInfo
+                });
             }
         } else if (message.type === 'visibility') {
             player.visible = message.visible === true;
